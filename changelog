@@ -245,3 +245,13 @@ v9.51 - Added: Preservation of SELinux contexts.
         Bug Fix: Data partition size calculated incorrectly when excluding Google Music cache.
         Bug Fix: TWRP backups taking too long for file list.
 v9.52 - Bug Fix: TWRP backups taking too long for file list.
+v10.0 - Added: Magisk / KernelSU / APatch support (finds their busybox, re-runs in the global mount namespace).
+        Added: Modern partition detection via /dev/block/by-name, including A/B slots (backs up the active slot).
+        Added: Backup of init_boot, vendor_boot, dtbo and vbmeta partitions (-a n, p, y, z).
+        Added: Android 10+ writes backups directly to /data/media/0 (where TWRP looks for them).
+        Added: toybox tar with --selinux is used when available, so SELinux labels are kept (TWRP compatible).
+        Added: Flashable Magisk module (scripts/build-magisk-module.sh).
+        Improvement: Device ID read from ro.serialno, backup files chowned to the storage owner.
+        Bug Fix: TWRP md5 files not generated (empty file list).
+        Bug Fix: "is common" flag of filesystem partitions never set ($10 instead of ${10}).
+        Bug Fix: Wrong exit code when busybox is missing.
