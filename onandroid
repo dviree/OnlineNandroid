@@ -1,3 +1,4 @@
+#!/system/bin/sh
 ###########################################################################################################
 ###########################################################################################################
 ##                                                                                                       ##
@@ -29,11 +30,11 @@
 ###########################################################################################################
 
 #### Define constants
-version="9.52"
+version="10.0"
 blobsdir="/clockworkmod/blobs"
 tz="utc"
 req_power=10
-all_partitions="mkbrwlgqvsdctjeoufhiax"
+all_partitions="mkbnpyzrwlgqvsdctjeoufhiax"
 sdcard_temp_mount="/mnt/sdcard4nandroid"
 sdext_temp_mount="/mnt/sdext4nandroid"
 custbkp_temp_mount="/mnt/custbkp4nandroid"
@@ -42,12 +43,44 @@ logfile="$logpath/onandroid.log"
 pidfile="$logpath/onandroid.pid"
 
 #### Set busybox path
+# Order: user override, busybox in PATH, then the busybox shipped with Magisk,
+# KernelSU and APatch (these are not in PATH on modern Android).
 bb=`cat /data/local/tmp/onandroid.busybox 2> /dev/null`
-if $bb [ ! $bb ]; then
-	if $bb [ `$bb which busybox` ]; then
+if [ ! "$bb" ]; then
+	if [ "`command -v busybox 2> /dev/null`" ]; then
 		bb="busybox"
+	else
+		for bb_try in /data/adb/magisk/busybox /data/adb/ksu/bin/busybox /data/adb/ap/bin/busybox /sbin/.magisk/busybox/busybox /system/xbin/busybox /system/bin/busybox; do
+			if [ -x "$bb_try" ]; then
+				bb="$bb_try"
+				break
+			fi
+		done
 	fi
 fi
+if [ ! "$bb" ]; then
+	echo "Error: busybox not found in path! Install Magisk (or a busybox module) or put the path to busybox in /data/local/tmp/onandroid.busybox. Exiting..."
+	exit 75
+fi
+
+#### Re-run in the global mount namespace (Magisk/KernelSU su may start us in an
+#### app's isolated namespace, where /data/data and /storage look different)
+if [ "$ONANDROID_NS" != "1" ] && [ -f "$0" ]; then
+	if [ "`$bb readlink /proc/self/ns/mnt 2> /dev/null`" != "`$bb readlink /proc/1/ns/mnt 2> /dev/null`" ]; then
+		if $bb nsenter -t 1 -m -- true 2> /dev/null; then
+			ONANDROID_NS=1 $bb nsenter -t 1 -m -- /system/bin/sh "$0" "$@"
+			exit $?
+		fi
+	fi
+fi
+export ONANDROID_NS=1
+
+#### Read a system property (getprop is missing on very old ROMs)
+prop(){
+	if [ "`command -v getprop 2> /dev/null`" ]; then
+		getprop "$1" 2> /dev/null
+	fi
+}
 
 #### Define exit codes (returned upon exit due to an error)
 E_NOROOT=65 # Could not acquire root permissions
@@ -118,6 +151,11 @@ LANG_SDFOUND="SD card found!"
 LANG_ISMTDDEV="This is an MTD based device!"
 LANG_ISEMMCDEV="This is an EMMC based device!"
 LANG_ISMTKDEV="This is an MTK based device!"
+LANG_ISBYNAMEDEV="Partitions found in /dev/block/by-name!"
+LANG_ABSLOT="A/B device, backing up active slot"
+LANG_INTERNALMEDIA="Using internal storage /data/media/0!"
+LANG_TARSELINUX="Using toybox tar with SELinux labels!"
+LANG_SYSTEMSAR="/system is part of a read-only dynamic partition and is not backed up. Restore it by flashing the stock ROM!"
 LANG_HASPATCH="This device has a patch file installed!"
 LANG_INCREMSELECTD="Incremental backup mode selected by default!"
 LANG_INCREMSELECTR="Incremental backup mode selected at run time!"
@@ -228,8 +266,10 @@ logmsg(){
 logerror(){
 	$bb echo "$1" >>$logfile
 	$bb echo "$2" >>$logfile
-	toolbox log -p i -t onandroid "$1"
-	toolbox log -p i -t onandroid "$2"
+	if $bb [ "`$bb which log`" != "" ]; then
+		log -p i -t onandroid "$1"
+		log -p i -t onandroid "$2"
+	fi
 }
 
 #### Cleanup function (Unmount temporary sdcard mount & remount root as ro)
@@ -286,6 +326,9 @@ cleanup(){
 
 #### Kill All Tools function (used while trapping exits)
 killalltools(){
+	if $bb [ "$bg_pid" != "" ]; then
+		$bb kill $bg_pid 2> /dev/null
+	fi
 	$bb killall $bb 2> /dev/null
 	$bb killall mkyaffs2image 2> /dev/null
 	$bb killall dedupe 2> /dev/null
@@ -371,6 +414,10 @@ advmapping(){
 	$bb echo "  m: mmcblk0_start (for Acer devices)"
 	$bb echo "  k: uboot (for MTK based devices)"
 	$bb echo "  b: boot"
+	$bb echo "  n: init_boot (Android 13+ GKI devices, patched by Magisk)"
+	$bb echo "  p: vendor_boot"
+	$bb echo "  y: dtbo"
+	$bb echo "  z: vbmeta"
 	$bb echo "  r: recovery"
 	$bb echo "  w: wimax (for Samsung devices)"
 	$bb echo "  l: appslog (for HTC and Sony (Ericsson) devices)"
@@ -431,6 +478,17 @@ progress_done(){
 	$bb echo -en " 100%"
 }
 
+#### Wait for a background job while showing progress
+wait_progress(){
+	wait_pid=$1 # PID of the background job.
+	wait_file=$2 # File being written (used by the progress indicator).
+	while $bb kill -0 $wait_pid 2> /dev/null; do
+		progress $wait_file
+		$bb sleep 2
+	done
+	bg_pid=""
+}
+
 #### Backup Function - Disk Dump
 nandroid_dd(){
 	part_name=$1 # Name of partition.Used only for display.
@@ -458,20 +516,16 @@ nandroid_dd(){
 			fi
 			if $bb [ "$part_start" == "" ]; then
 				$bb dd if=$part_path/$part_dev of=$path/$name/$part_fname.$img_ext bs=$part_bs 2> /dev/null &
-				while $bb [ `$bb ps w | $bb grep "$bb dd" | $bb grep -v "$bb grep $bb dd" | $bb tail -n 1 | $bb awk '{print $1}'` ]; do
-					progress $part_fname.$img_ext
-					$bb sleep 2
-				done
+				bg_pid=$!
+				wait_progress $bg_pid $part_fname.$img_ext
 				progress_done
 				$bb echo ""
 			else
 				part_start=`$bb expr $part_start / $part_bs`
 				part_count=`$bb expr $part_count / $part_bs`
 				$bb dd if=$part_path/$part_dev of=$path/$name/$part_fname.$img_ext bs=$part_bs skip=$part_start count=$part_count 2> /dev/null &
-				while $bb [ `$bb ps w | $bb grep "$bb dd" | $bb grep -v "$bb grep $bb dd" | $bb tail -n 1 | $bb awk '{print $1}'` ]; do
-					progress $part_fname.$img_ext
-					$bb sleep 2
-				done
+				bg_pid=$!
+				wait_progress $bg_pid $part_fname.$img_ext
 				progress_done
 				$bb echo ""
 			fi
@@ -490,7 +544,7 @@ nandroid_fs(){
 	part_size=$7 # Partition size.
 	part_excludes=$8 # Excludes for tar
 	part_excludes_dedupe=$9 # Excludes for dedupe
-	part_iscommon=$10 # Is partition common among all android?
+	part_iscommon=${10} # Is partition common among all android?
 	# Usage: nandroid_fs $part_name $part_fname $part_id $part_mount $part_mountdir $part_fs $part_size $part_excludes $part_excludes_dedupe $part_iscommon
 
 	if $bb [ "`$bb echo $adv | $bb grep $part_id`" != "" ]; then
@@ -508,38 +562,30 @@ nandroid_fs(){
 					full_size=-1
 				fi
 				if $bb [ "$compress_backup" == "yes" ]; then
-					$bb tar -cpzf $path/$name/$part_fname.$part_fs.win $part_excludes ./* > /dev/null 2>&1 &
+					$tar_cmd -cpzf $path/$name/$part_fname.$part_fs.win $part_excludes ./* > /dev/null 2>&1 &
+					bg_pid=$!
 					$bb sleep 2
-					while $bb [ `$bb ps w | $bb grep "$bb tar" | $bb grep -v "$bb grep $bb tar" | $bb tail -n 1 | $bb awk '{print $1}'` ]; do
-						progress $part_fname.$part_fs.win
-						$bb sleep 2
-					done
-					if $bb [ ! -f $path/$name/$part_fname.$part_fs.win ]; then
+					wait_progress $bg_pid $part_fname.$part_fs.win
+					if $bb [ ! -f $path/$name/$part_fname.$part_fs.win -a "$tar_is_toybox" != "yes" ]; then
 						$bb tar -cpZf $path/$name/$part_fname.$part_fs.win $part_excludes ./* > /dev/null 2>&1 &
+						bg_pid=$!
 						$bb sleep 2
-						while $bb [ `$bb ps w | $bb grep "$bb tar" | $bb grep -v "$bb grep $bb tar" | $bb tail -n 1 | $bb awk '{print $1}'` ]; do
-							progress $part_fname.$part_fs.win
-							$bb sleep 2
-						done
+						wait_progress $bg_pid $part_fname.$part_fs.win
 					fi
 					progress_done
 					$bb echo ""
 				elif $bb [ "$compress_backup" == "gzip" ]; then
-					$bb tar -cp $part_excludes ./* | $bb gzip -c > $path/$name/$part_fname.$part_fs.win 2> /dev/null &
+					$tar_cmd -cp $part_excludes ./* | $bb gzip -c > $path/$name/$part_fname.$part_fs.win 2> /dev/null &
+					bg_pid=$!
 					$bb sleep 2
-					while $bb [ `$bb ps w | $bb grep "$bb tar" | $bb grep -v "$bb grep $bb tar" | $bb tail -n 1 | $bb awk '{print $1}'` ]; do
-						progress $part_fname.$part_fs.win
-						$bb sleep 2
-					done
+					wait_progress $bg_pid $part_fname.$part_fs.win
 					progress_done
 					$bb echo ""
 				else
-					$bb tar -cpf $path/$name/$part_fname.$part_fs.win $part_excludes ./* > /dev/null 2>&1 &
+					$tar_cmd -cpf $path/$name/$part_fname.$part_fs.win $part_excludes ./* > /dev/null 2>&1 &
+					bg_pid=$!
 					$bb sleep 2
-					while $bb [ `$bb ps w | $bb grep "$bb tar" | $bb grep -v "$bb grep $bb tar" | $bb tail -n 1 | $bb awk '{print $1}'` ]; do
-						progress $part_fname.$part_fs.win
-						$bb sleep 2
-					done
+					wait_progress $bg_pid $part_fname.$part_fs.win
 					progress_done
 					$bb echo ""
 				fi
@@ -579,12 +625,10 @@ nandroid_fs(){
 							full_size=-1
 						fi
 						$bb touch $path/$name/$part_fname.$part_fs.tar
-						$bb tar -cp $part_excludes $part_mountdir 2> /dev/null | $bb split -a 1 -b 1000000000 /proc/self/fd/0 $path/$name/$part_fname.$part_fs.tar. > /dev/null 2>&1 &
+						$tar_cmd -cp $part_excludes $part_mountdir 2> /dev/null | $bb split -a 1 -b 1000000000 /proc/self/fd/0 $path/$name/$part_fname.$part_fs.tar. > /dev/null 2>&1 &
+						bg_pid=$!
 						$bb sleep 2
-						while $bb [ `$bb ps w | $bb grep "$bb tar" | $bb grep -v "$bb grep $bb tar" | $bb tail -n 1 | $bb awk '{print $1}'` ]; do
-							progress $part_fname.$part_fs.tar
-							$bb sleep 2
-						done
+						wait_progress $bg_pid $part_fname.$part_fs.tar
 						progress_done
 						$bb echo ""
 					else
@@ -593,12 +637,10 @@ nandroid_fs(){
 						else
 							full_size=-1
 						fi
-						$bb tar -cpf $path/$name/$part_fname.$part_fs.tar $part_excludes $part_mountdir > /dev/null 2>&1 &
+						$tar_cmd -cpf $path/$name/$part_fname.$part_fs.tar $part_excludes $part_mountdir > /dev/null 2>&1 &
+						bg_pid=$!
 						$bb sleep 2
-						while $bb [ `$bb ps w | $bb grep "$bb tar" | $bb grep -v "$bb grep $bb tar" | $bb tail -n 1 | $bb awk '{print $1}'` ]; do
-							progress $part_fname.$part_fs.tar
-							$bb sleep 2
-						done
+						wait_progress $bg_pid $part_fname.$part_fs.tar
 						progress_done
 						$bb echo ""
 					fi
@@ -648,7 +690,21 @@ check_size_dd(){
 	if $bb [ "$part_type" == "not_found" -o "$part_dev" == "" -o "`$bb echo $adv | $bb grep $part_id`" == "" ]; then
 		eval "u_${part_name}=0"
 	else
-		if $bb [ $part_type == "/proc/dumchar_info" ]; then
+		if $bb [ $part_type == "by-name" ]; then
+			part_count=`$bb blockdev --getsize64 $part_path/$part_dev 2> /dev/null`
+			if $bb [ ! "`$bb echo $part_count | $bb egrep "^[0-9]+$"`" ]; then
+				part_sysblk=`$bb basename \`$bb readlink -f $part_path/$part_dev\``
+				part_count=`$bb cat /sys/class/block/$part_sysblk/size 2> /dev/null`
+				part_count=`$bb expr $part_count \* 512 2> /dev/null`
+			fi
+			if $bb [ ! "`$bb echo $part_count | $bb egrep "^[0-9]+$"`" ]; then
+				part_count=0
+			fi
+			eval "${part_name}_count=${part_count}"
+			u_part=`$bb expr $part_count / $part_bytediv`
+			u_part=`$bb expr $u_part + 1`
+			eval "u_${part_name}=${u_part}"
+		elif $bb [ $part_type == "/proc/dumchar_info" ]; then
 			part_hex=`$bb cat $part_type | $bb grep "^$part_cnamemtk.*0x" | $bb awk '{print $2}'`
 			part_dec=`$bb printf "%d \n" $part_hex`
 			part_count=`$bb expr $part_dec`
@@ -835,7 +891,14 @@ elif $bb [ -f $sdcard/TWRP/.twrps ]; then
 		fi
 	fi
 else
-	android_id=`$bb cat /proc/cmdline 2> /dev/null | $bb tr ' ' '\n' | $bb grep "androidboot.serialno=" | $bb tail -n 1 | $bb cut -d '=' -f 2`
+	# Modern devices pass the serial via properties / bootconfig, not cmdline
+	android_id=`prop ro.serialno`
+	if $bb [ ! "$android_id" ]; then
+		android_id=`prop ro.boot.serialno`
+	fi
+	if $bb [ ! "$android_id" ]; then
+		android_id=`$bb cat /proc/cmdline 2> /dev/null | $bb tr ' ' '\n' | $bb grep "androidboot.serialno=" | $bb tail -n 1 | $bb cut -d '=' -f 2`
+	fi
 	if $bb [ ! "$android_id" ]; then
 		android_id=`$bb cat /proc/cpuinfo | $bb grep "Serial" | $bb awk '{print $3}'`
 	fi
@@ -1016,9 +1079,18 @@ fi
 #### Check if SD card is mounted
 logmsg "$LANG_SEARCHSD..."
 # Use storage media / path if provided
+sdk=`prop ro.build.version.sdk`
+if $bb [ ! "`$bb echo $sdk | $bb egrep "^[0-9]+$"`" ]; then
+	sdk=0
+fi
 if $bb [ "$storage" != "" ] && $bb [ -d $storage ]; then
 	sdcard=$storage
 	logmsg "$LANG_ALTERNATEMEDIA"
+elif $bb [ $sdk -ge 29 -a -d /data/media/0 ]; then
+	# Android 10+: /sdcard is a FUSE view that differs per mount namespace, so
+	# write straight to the backing directory (this is where TWRP looks too)
+	sdcard="/data/media/0"
+	logmsg "$LANG_INTERNALMEDIA"
 else
 	# Continue the search for an sd card
 	sdcard="$EXTERNAL_STORAGE"
@@ -1026,6 +1098,9 @@ else
 		sdcard="sdcard"
 	fi
 	sdcard=`$bb mount | $bb grep -v "/mnt/asec/" | $bb egrep -i "($sdcard|sdcard|external|storage|shell).* type (vfat|fuse)" | $bb tail -n 1 | $bb cut -d ' ' -f 3`
+	if $bb [ ! "$sdcard" -a -d /data/media/0 ]; then
+		sdcard="/data/media/0"
+	fi
 	if $bb [ ! "$sdcard" ]; then
 		logmsg "$LANG_SDNOTFOUND $LANG_EXITING..."
 		logerror "$LANG_MOUNTS:" "`$bb mount | $bb grep -v "/mnt/asec/"`"
@@ -1045,6 +1120,27 @@ fi
 #### Set backup path
 path=$sdcard$path
 blobsdir=$sdcard$blobsdir
+
+#### Detect A/B slot (empty on non-A/B devices)
+slot=`prop ro.boot.slot_suffix`
+if $bb [ ! "$slot" ]; then
+	slot=`$bb cat /proc/cmdline /proc/bootconfig 2> /dev/null | $bb tr ' ' '\n' | $bb grep "androidboot.slot_suffix" | $bb tail -n 1 | $bb cut -d '=' -f 2 | $bb tr -d '" '`
+fi
+if $bb [ ! "$slot" ]; then
+	slot=`prop ro.boot.slot`
+	if $bb [ "$slot" ]; then
+		slot="_$slot"
+	fi
+fi
+
+#### Find a partition by name (current slot first) in a by-name directory
+byname(){
+	if $bb [ -e "$part_path/$1$slot" ]; then
+		$bb echo "$1$slot"
+	elif $bb [ -e "$part_path/$1" ]; then
+		$bb echo "$1"
+	fi
+}
 
 #### Detect partition layouts
 part_type="not_found"
@@ -1080,6 +1176,19 @@ if $bb [ -f "/proc/dumchar_info" ]; then
 	else
 		part_type="not_found"
 	fi
+fi
+if $bb [ "$part_type" == "not_found" ]; then
+	# Modern devices: no /proc/emmc or /proc/mtd, partitions are only exposed as by-name symlinks
+	for byname_try in /dev/block/by-name /dev/block/bootdevice/by-name /dev/block/platform/*/by-name /dev/block/platform/*/*/by-name; do
+		if $bb [ -d $byname_try ]; then
+			part_type="by-name"
+			part_path="$byname_try"
+			part_bytediv=1048576
+			part_bsval=4096
+			logmsg "$LANG_ISBYNAMEDEV"
+			break
+		fi
+	done
 fi
 if $bb [ -f "/system/partlayout4nandroid" ]; then
 	if $bb [ "`$bb cat /system/partlayout4nandroid | $bb egrep "(mtd|mmc|bml|nand|act)"`" != "" ]; then
@@ -1225,19 +1334,19 @@ else
 fi
 
 #### Check if device has a yaffs2 file system
-system_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /system " | $bb cut -d ' ' -f 5`"
-data_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on $data_mount " | $bb cut -d ' ' -f 5`"
-cache_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /cache " | $bb cut -d ' ' -f 5`"
-datadata_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /datadata " | $bb cut -d ' ' -f 5`"
-datadatai_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /data/data " | $bb cut -d ' ' -f 5`"
-efs_fs="`$bb mount | $bb grep "on /efs " | $bb cut -d ' ' -f 5`"
-preload_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /preload " | $bb cut -d ' ' -f 5`"
-custbkp_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /.cust_backup " | $bb cut -d ' ' -f 5`"
-flexrom_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /flexrom " | $bb cut -d ' ' -f 5`"
-custpack_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /custpack " | $bb cut -d ' ' -f 5`"
-mobileinfo_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /mobile_info " | $bb cut -d ' ' -f 5`"
-fsboot_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /boot " | $bb cut -d ' ' -f 5`"
-fsrecovery_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /recovery " | $bb cut -d ' ' -f 5`"
+system_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /system " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
+data_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on $data_mount " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
+cache_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /cache " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
+datadata_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /datadata " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
+datadatai_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /data/data " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
+efs_fs="`$bb mount | $bb grep "on /efs " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
+preload_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /preload " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
+custbkp_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /.cust_backup " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
+flexrom_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /flexrom " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
+custpack_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /custpack " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
+mobileinfo_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /mobile_info " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
+fsboot_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /boot " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
+fsrecovery_fs="`$bb mount | $bb grep -v "/mnt/asec/" | $bb grep "on /recovery " | $bb cut -d ' ' -f 5 | $bb head -n 1`"
 
 if $bb [ "$system_fs" == "yaffs2" -o "$data_fs" == "yaffs2" -o "$cache_fs" == "yaffs2" -o "$datadata_fs" == "yaffs2" -o "$datadatai_fs" == "yaffs2" -o "$efs_fs" == "yaffs2" -o "$preload_fs" == "yaffs2" -o "$custbkp_fs" == "yaffs2" -o "$flexrom_fs" == "yaffs2" -o "$custpack_fs" == "yaffs2" -o "$mobileinfo_fs" == "yaffs2" -o "$fsboot_fs" == "yaffs2" -o "$fsrecovery_fs" == "yaffs2" ]; then
 	has_yaffs2="true"
@@ -1255,9 +1364,20 @@ if $bb [ "$backup_style" == "incremental" -o "$backup_style" == "gc" ]; then
 		exit $E_NODEDUPE
 	fi
 fi
-if $bb [ "`$bb which busybox`" == "" ]; then
+if $bb [ "$bb" != "busybox" -a ! -x "$bb" ] && $bb [ "`$bb which $bb`" == "" ]; then
 	logmsg "$LANG_ERROR: $LANG_NOBUSYBOX $LANG_EXITING..."
-	exit $E_NOBB
+	exit $E_NOBUSYBOX
+fi
+# Prefer toybox tar with --selinux (Android 10+): it stores SELinux labels in
+# the same format as TWRP, so restored files keep their contexts.
+tar_cmd="$bb tar"
+tar_is_toybox="no"
+if $bb [ "`$bb which toybox`" != "" ]; then
+	if $bb [ "`toybox tar --help 2>&1 | $bb grep -e '--selinux'`" != "" ]; then
+		tar_cmd="toybox tar --selinux"
+		tar_is_toybox="yes"
+		logmsg "$LANG_TARSELINUX"
+	fi
 fi
 logmsg "$LANG_ALLTOOLSOK"
 
@@ -1339,7 +1459,23 @@ fi
 
 #### Detect /boot, /recovery, /wimax, /appslog, /kernel, /modem and /TA partitions
 if $bb [ $part_type != "not_found" ]; then
-	if $bb [ $part_type == "/proc/dumchar_info" ]; then
+	if $bb [ $part_type == "by-name" ]; then
+		part_uboot=`byname uboot`
+		part_boot=`byname boot`
+		part_initboot=`byname init_boot`
+		part_vendorboot=`byname vendor_boot`
+		part_dtbo=`byname dtbo`
+		part_vbmeta=`byname vbmeta`
+		part_recovery=`byname recovery`
+		part_wimax=`byname wimax`
+		part_appslog=`byname appslog`
+		part_kernel=`byname kernel`
+		part_modem=`byname modem`
+		part_ta=`byname TA`
+		if $bb [ "$slot" ]; then
+			logmsg "$LANG_ABSLOT: $slot"
+		fi
+	elif $bb [ $part_type == "/proc/dumchar_info" ]; then
 		part_uboot=`$bb cat $part_type | $bb grep "^uboot.*0x" | $bb awk '{print $5}' | $bb cut -d '/' -f 4`
 		part_boot=`$bb cat $part_type | $bb grep "^bootimg.*0x" | $bb awk '{print $5}' | $bb cut -d '/' -f 4`
 		part_recovery=`$bb cat $part_type | $bb grep "^recovery.*0x" | $bb awk '{print $5}' | $bb cut -d '/' -f 4`
@@ -1378,6 +1514,18 @@ check_size_dd "$part_uboot" "uboot" "k" "uboot" "uboot"
 
 #### /boot partition size
 check_size_dd "$part_boot" "boot" "b" "boot" "bootimg"
+
+#### /init_boot partition size (Android 13+ GKI devices)
+check_size_dd "$part_initboot" "initboot" "n" "init_boot" "init_boot"
+
+#### /vendor_boot partition size
+check_size_dd "$part_vendorboot" "vendorboot" "p" "vendor_boot" "vendor_boot"
+
+#### /dtbo partition size
+check_size_dd "$part_dtbo" "dtbo" "y" "dtbo" "dtbo"
+
+#### /vbmeta partition size
+check_size_dd "$part_vbmeta" "vbmeta" "z" "vbmeta" "vbmeta"
 
 #### /recovery partition size
 check_size_dd "$part_recovery" "recovery" "r" "recovery" "recovery"
@@ -1566,7 +1714,7 @@ else
 fi
 
 #### Required space calculation
-req_space=`$bb expr $u_mmcblk0_start + $u_uboot + $u_boot + $u_recovery + $u_wimax + $u_appslog + $u_kernel + $u_modem + $u_ta + $u_system + $u_data + $u_cache + $u_datadata + $u_datadatai + $u_efs + $u_preload + $u_custbkp + $u_flexrom + $u_custpack + $u_mobileinfo + $u_fsboot + $u_fsrecovery + $u_as + $u_sdext`
+req_space=`$bb expr $u_mmcblk0_start + $u_uboot + $u_boot + $u_initboot + $u_vendorboot + $u_dtbo + $u_vbmeta + $u_recovery + $u_wimax + $u_appslog + $u_kernel + $u_modem + $u_ta + $u_system + $u_data + $u_cache + $u_datadata + $u_datadatai + $u_efs + $u_preload + $u_custbkp + $u_flexrom + $u_custpack + $u_mobileinfo + $u_fsboot + $u_fsrecovery + $u_as + $u_sdext`
 
 #### Available space calculation
 freespace=`$bb df -Pm $sdcard | $bb tail -n 1 | $bb awk '{print $4}'`
@@ -1585,7 +1733,11 @@ if $bb [ $freespace -lt $req_space ]; then
 	fi
 	logmsg "$LANG_NOSPACE $LANG_EXITING..."
 	logerror "df:" "`$bb df -Pm`"
-	logerror "$LANG_PARTITIONS:" "`$bb cat $part_type`"
+	if $bb [ $part_type == "by-name" ]; then
+		logerror "$LANG_PARTITIONS:" "`$bb ls -l $part_path`"
+	else
+		logerror "$LANG_PARTITIONS:" "`$bb cat $part_type`"
+	fi
 	logerror ".android_secure:" "$u_as"
 	logerror "sd-ext:" "$u_sdext"
 	cleanup
@@ -1670,11 +1822,9 @@ logmsg "$LANG_BACKINGUPTO $path/$name"
 if $bb [ "$replace_backup" == "yes" ]; then
 	logmsg "$LANG_BACKINGUPOLD...\c"
 	$bb mv $path/$name $path/${name}_old &
+	bg_pid=$!
 	$bb sleep 2
-	while $bb [ `$bb ps w | $bb grep "$bb mv" | $bb grep -v "$bb grep $bb mv" | $bb tail -n 1 | $bb awk '{print $1}'` ]; do
-		progress moving_old_backup
-		$bb sleep 2
-	done
+	wait_progress $bg_pid moving_old_backup
 	progress_done
 	$bb echo ""
 	# Make new directory for the current backup
@@ -1702,9 +1852,19 @@ if $bb [ $part_type == "not_found" -o "$part_boot" == "" ]; then
 	logmsg "$LANG_PATCHNOTICE"
 fi
 
+#### Backup init_boot, vendor_boot, dtbo and vbmeta (modern devices; Magisk patches init_boot if present, else boot)
+nandroid_dd "init_boot" "init_boot" "$part_initboot" "n" "$u_initboot" "$part_bsval" "$initboot_count" "$initboot_start" "no"
+nandroid_dd "vendor_boot" "vendor_boot" "$part_vendorboot" "p" "$u_vendorboot" "$part_bsval" "$vendorboot_count" "$vendorboot_start" "no"
+nandroid_dd "dtbo" "dtbo" "$part_dtbo" "y" "$u_dtbo" "$part_bsval" "$dtbo_count" "$dtbo_start" "no"
+nandroid_dd "vbmeta" "vbmeta" "$part_vbmeta" "z" "$u_vbmeta" "$part_bsval" "$vbmeta_count" "$vbmeta_start" "no"
+
 #### Backup recovery
 if $bb [ "$is_fsrecovery" != "yes" ]; then
-	nandroid_dd "recovery" "recovery" "$part_recovery" "r" "$u_recovery" "$part_bsval" "$recovery_count" "$recovery_start" "yes"
+	if $bb [ $part_type == "by-name" -a "$slot" != "" ]; then
+		nandroid_dd "recovery" "recovery" "$part_recovery" "r" "$u_recovery" "$part_bsval" "$recovery_count" "$recovery_start" "no"
+	else
+		nandroid_dd "recovery" "recovery" "$part_recovery" "r" "$u_recovery" "$part_bsval" "$recovery_count" "$recovery_start" "yes"
+	fi
 fi
 
 #### Backup wimax (for Samsung devices)
@@ -1722,8 +1882,15 @@ nandroid_dd "modem" "modem" "$part_modem" "q" "$u_modem" "$part_bsval" "$modem_c
 #### Backup TA
 nandroid_dd "TA" "ta" "$part_ta" "v" "$u_ta" "$part_bsval" "$ta_count" "$ta_start" "no"
 
-#### Backup /system
-nandroid_fs "system" "system" "s" "/system" "system" "$system_fs" "$u_system" "$system_excludes" "$system_excludes_dedupe" "yes"
+#### Backup /system (on system-as-root / dynamic partition devices /system is a
+#### read-only, verified image that is not mounted on its own; flash the stock ROM instead)
+if $bb [ "$system_fs" == "" -a $part_type == "by-name" -a "`$bb echo $adv | $bb grep 's'`" != "" ]; then
+	logmsg "$LANG_SYSTEMSAR"
+	system_iscommon="no"
+else
+	system_iscommon="yes"
+fi
+nandroid_fs "system" "system" "s" "/system" "system" "$system_fs" "$u_system" "$system_excludes" "$system_excludes_dedupe" "$system_iscommon"
 
 #### Backup /data
 nandroid_fs "data" "data" "d" "$data_mount" "data" "$data_fs" "$u_data" "$data_excludes" "$data_excludes_dedupe" "yes"
@@ -1793,11 +1960,9 @@ cleanup
 if $bb [ "$replace_backup" == "yes" ]; then
 	logmsg "$LANG_REPLACINGOLD...\c"
 	$bb mv $path/$name/* $path/${name}_old &
+	bg_pid=$!
 	$bb sleep 2
-	while $bb [ `$bb ps w | $bb grep "$bb mv" | $bb grep -v "$bb grep $bb mv" | $bb tail -n 1 | $bb awk '{print $1}'` ]; do
-		progress replacing_new_backup
-		$bb sleep 2
-	done
+	wait_progress $bg_pid replacing_new_backup
 	progress_done
 	$bb echo ""
 	# Remove new backup directory and rename temporary/old backup directory
@@ -1817,15 +1982,13 @@ fi
 
 #### Generate md5
 if $bb [ "$backup_style" == "twrp" -a "$generate_md5" != "no" ]; then
-	files=`$bb ls -lA1 | $bb awk '{print $7}' | $bb grep -v ".md5"`
+	files=`$bb ls -A1 | $bb grep -v "\.md5$"`
 	for file in $files; do
 		logmsg "$LANG_GENMD5SUMFOR $file...\c"
 		$bb md5sum $file > $file.md5 2> /dev/null &
+		bg_pid=$!
 		$bb sleep 2
-		while $bb [ `$bb ps w | $bb grep "$bb md5sum" | $bb grep -v "$bb grep $bb md5sum" | $bb tail -n 1 | $bb awk '{print $1}'` ]; do
-			progress md5sum_generate
-			$bb sleep 2
-		done
+		wait_progress $bg_pid md5sum_generate
 		$bb sleep 1
 		while $bb [ `$bb stat -t $file.md5 | $bb awk '{print $2}'` == "0" ]; do
 			progress md5sum_validate
@@ -1842,11 +2005,9 @@ else
 		$bb rm nandroid.md5
 	fi
 	$bb md5sum .* * > nandroid.md5 2> /dev/null &
+	bg_pid=$!
 	$bb sleep 2
-	while $bb [ `$bb ps w | $bb grep "$bb md5sum" | $bb grep -v "$bb grep $bb md5sum" | $bb tail -n 1 | $bb awk '{print $1}'` ]; do
-		progress md5sum_generate
-		$bb sleep 2
-	done
+	wait_progress $bg_pid md5sum_generate
 	progress_done
 	$bb echo ""
 	# Verify md5sum (to check if the file is populated)
@@ -1878,6 +2039,13 @@ logerror "###########################" ""
 bkp_files=`$bb ls -l1A $path/$name`
 logerror "$LANG_FILESBKPEDUP:" "\"$bkp_files\""
 $bb cp $logfile $path/$name/recovery.log
+
+#### Give the backup the owner of the storage directory (root-owned files in
+#### /data/media can't be managed from Android file managers)
+storage_owner=`$bb stat -c "%u:%g" $sdcard 2> /dev/null`
+if $bb [ "$storage_owner" != "" -a "$storage_owner" != "0:0" ]; then
+	$bb chown -R $storage_owner $path 2> /dev/null
+fi
 
 #### LED detection
 # Xperia Pro

@@ -1,0 +1,6 @@
+id=onandroid
+name=Online Nandroid
+version=v10.0
+versionCode=1000
+author=Ameer Dawood
+description=Nandroid/TWRP backups while Android is running. Run "su -c onandroid" (see onandroid --help).
